@@ -5,7 +5,7 @@ Based on FastMCP (stdio transport), reuses existing decryption.
 Runs on Windows Python (needs access to D:\ WeChat databases).
 """
 
-import os, sys, json, time, sqlite3, tempfile, struct, hashlib, atexit, re
+import os, sys, json, time, sqlite3, tempfile, struct, hashlib, atexit, re, secrets
 import hmac as hmac_mod
 from contextlib import closing
 from datetime import datetime
@@ -15,6 +15,7 @@ from mcp.server.fastmcp import FastMCP
 import zstandard as zstd
 from decode_image import ImageResolver
 from key_utils import get_key_info, key_path_variants, strip_key_metadata
+from config import resolve_allowed_clients, _APP_DIR
 
 # ============ 加密常量 ============
 PAGE_SZ = 4096
@@ -1988,5 +1989,186 @@ def get_date_stats(date: str, small_group_max: int = 10, tz: str = "Asia/Shangha
     return "\n".join(lines)
 
 
+# ============ Health Check ============
+
+MCP_VERSION = "0.6.0-network"
+
+
+@mcp.tool()
+def health() -> str:
+    """MCP 健康检查, 返回 {ok, version, ts}"""
+    return json.dumps({
+        "ok": True,
+        "version": MCP_VERSION,
+        "ts": int(time.time()),
+    })
+
+
+# ============ Network Transport + Middleware ============
+
+def _eprint(*args, **kwargs):
+    """打印到 stderr, 不污染 stdio transport 的 stdout"""
+    print(*args, file=sys.stderr, **kwargs)
+
+
+def _build_starlette_app(cfg):
+    """把 FastMCP.sse_app() 或 streamable_http_app() 包一层 Starlette 中间件,
+    加上: Bearer token 鉴权, IP/Host 白名单, rate limit, /health 端点, 访问日志.
+    """
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse, Response
+    from starlette.routing import Mount, Route
+    import collections
+    import threading
+
+    net = cfg["network"]
+    transport = net.get("transport", "sse")
+    auth_token = (net.get("auth_token") or "").strip()
+    rate_per_min = int(net.get("rate_limit_per_min") or 120)
+    ip_set, domain_set = resolve_allowed_clients(net)
+
+    # 访问日志
+    log_dir = os.path.join(_APP_DIR, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    access_log_path = os.path.join(log_dir, "mcp_access.log")
+    log_lock = threading.Lock()
+
+    def _log_access(event, ip, host, detail=""):
+        line = f"{datetime.now().isoformat(timespec='seconds')} {event} ip={ip} host={host or '-'} {detail}\n"
+        with log_lock:
+            try:
+                with open(access_log_path, "a", encoding="utf-8") as f:
+                    f.write(line)
+            except OSError:
+                pass
+
+    # rate limit: {key: deque[timestamps]}
+    rate_buckets = collections.defaultdict(collections.deque)
+    rate_lock = threading.Lock()
+
+    def _check_rate(key):
+        now = time.time()
+        with rate_lock:
+            dq = rate_buckets[key]
+            while dq and dq[0] < now - 60:
+                dq.popleft()
+            if len(dq) >= rate_per_min:
+                return False
+            dq.append(now)
+            return True
+
+    class AuthAllowlistMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            # /health 无鉴权, 直接放行
+            if request.url.path == "/health":
+                return await call_next(request)
+
+            # 拿客户端 IP 和 Host
+            client = request.client
+            ip = client.host if client else "?"
+            host = request.headers.get("host", "")
+            host_name = host.split(":", 1)[0].lower() if host else ""
+
+            # 1) IP/Host 白名单 (如果配置了 allow_clients)
+            if ip_set or domain_set:
+                allowed = (ip in ip_set) or (host_name and host_name in domain_set)
+                if not allowed:
+                    _log_access("DENY_IP", ip, host_name, f"path={request.url.path}")
+                    return JSONResponse({"error": "forbidden"}, status_code=403)
+
+            # 2) Bearer token (如果配置了 auth_token)
+            if auth_token:
+                got = request.headers.get("authorization", "")
+                if not got.startswith("Bearer "):
+                    _log_access("DENY_NOAUTH", ip, host_name, f"path={request.url.path}")
+                    return JSONResponse({"error": "unauthorized"}, status_code=401)
+                if not secrets.compare_digest(got[7:].strip(), auth_token):
+                    _log_access("DENY_BADTOKEN", ip, host_name, f"path={request.url.path}")
+                    return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+            # 3) rate limit (按 ip+host 组合计)
+            rate_key = f"{ip}|{host_name}"
+            if not _check_rate(rate_key):
+                _log_access("DENY_RATE", ip, host_name, f"path={request.url.path}")
+                return JSONResponse({"error": "too many requests"}, status_code=429)
+
+            _log_access("ALLOW", ip, host_name, f"path={request.url.path}")
+            return await call_next(request)
+
+    async def _health(request):
+        return JSONResponse({
+            "ok": True,
+            "version": MCP_VERSION,
+            "ts": int(time.time()),
+        })
+
+    # 拿到 FastMCP 的 Starlette app
+    if transport == "streamable-http":
+        inner_app = mcp.streamable_http_app()
+    else:
+        inner_app = mcp.sse_app()
+
+    app = Starlette(
+        debug=False,
+        routes=[
+            Route("/health", _health, methods=["GET", "HEAD"]),
+            Mount("/", inner_app),
+        ],
+        middleware=[Middleware(AuthAllowlistMiddleware)],
+    )
+    return app, access_log_path
+
+
+def _run_network_server(cfg):
+    """在 network.enabled=true 时用 uvicorn 起 Starlette app"""
+    try:
+        import uvicorn
+    except ImportError:
+        _eprint("[mcp] network transport 需要 uvicorn (pip install uvicorn>=0.30)")
+        sys.exit(2)
+
+    net = cfg["network"]
+    app, log_path = _build_starlette_app(cfg)
+
+    host = net.get("bind_host", "0.0.0.0")
+    port = int(net.get("bind_port", 8765))
+    tls = net.get("tls") or {}
+
+    _eprint(f"[mcp] transport={net.get('transport')} listening on {host}:{port}")
+    _eprint(f"[mcp] access log: {log_path}")
+    if net.get("auth_token"):
+        _eprint("[mcp] Bearer auth enabled")
+    ip_set, dom_set = resolve_allowed_clients(net)
+    if ip_set or dom_set:
+        _eprint(f"[mcp] allowlist: ip={sorted(ip_set)} domain={sorted(dom_set)}")
+    else:
+        _eprint("[mcp] WARNING: no allowlist configured, accepting all IPs/domains")
+
+    uvicorn_kwargs = {
+        "host": host,
+        "port": port,
+        "log_level": "warning",
+        "access_log": False,
+    }
+    if tls.get("enabled") and tls.get("cert") and tls.get("key"):
+        uvicorn_kwargs["ssl_certfile"] = tls["cert"]
+        uvicorn_kwargs["ssl_keyfile"] = tls["key"]
+        _eprint(f"[mcp] TLS enabled, cert={tls['cert']}")
+
+    uvicorn.run(app, **uvicorn_kwargs)
+
+
 if __name__ == "__main__":
-    mcp.run()
+    # 根据 config.network.enabled 决定 stdio 还是 network transport
+    try:
+        _net_cfg = _cfg.get("network") or {}
+    except Exception:
+        _net_cfg = {}
+
+    if _net_cfg.get("enabled"):
+        _run_network_server(_cfg)
+    else:
+        # 默认 stdio — 完全兼容原有 Claude Desktop 行为
+        mcp.run()

@@ -25,6 +25,9 @@ dist/
 build/
 *.spec.bak
 
+# Network MCP runtime logs
+logs/
+
 # OS
 .DS_Store
 Thumbs.db
