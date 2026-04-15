@@ -20,6 +20,11 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
+# Build artifacts
+dist/
+build/
+*.spec.bak
+
 # OS
 .DS_Store
 Thumbs.db

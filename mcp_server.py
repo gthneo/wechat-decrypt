@@ -1734,5 +1734,259 @@ def get_chat_images(chat_name: str, limit: int = 20) -> str:
     return f"{display_name} 的 {len(lines)} 张图片:\n\n" + "\n".join(lines)
 
 
+@mcp.tool()
+def get_date_stats(date: str, small_group_max: int = 10, tz: str = "Asia/Shanghai") -> str:
+    """统计指定日期的微信消息情况, 一次调用返回多维度聚合:
+      - 当日消息总数
+      - 按类别分桶(direct DM / 群聊 / 静音群 / 订阅号 / 服务号)的消息数
+      - 我发出的消息数 vs 我收到的 direct message 数
+      - 小群(成员数 ≤ small_group_max)内的消息数
+
+    Args:
+        date: 日期, 格式 YYYY-MM-DD (例如 2026-04-12)
+        small_group_max: "小群"的成员数上限, 默认 10(即 ≤10 人的群)
+        tz: 解释 date 的时区名(IANA), 默认 Asia/Shanghai. 锁死时区避免在 UTC
+            服务器或不同 Locale 上跑出歧义结果. 传 "local" 则使用机器本地时区.
+    """
+    import datetime as _dt
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        ZoneInfo = None
+
+    try:
+        day_naive = _dt.datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        return f"日期格式错误, 应为 YYYY-MM-DD, 实际: {date}"
+
+    if tz == "local" or ZoneInfo is None:
+        # 退回到机器本地时区 (与旧行为兼容)
+        day = day_naive
+        tz_label = "local"
+    else:
+        try:
+            zone = ZoneInfo(tz)
+        except Exception as e:
+            # Windows 默认无 IANA tzdata, 提示安装方法
+            hint = ""
+            if "No time zone found" in str(e) or "tzdata" in str(e).lower():
+                hint = " (Windows 上请先 `pip install tzdata`, 或传 tz=\"local\" 改用机器本地时区)"
+            return f"无法加载时区 {tz}: {e}{hint}"
+        day = day_naive.replace(tzinfo=zone)
+        tz_label = tz
+
+    start_ts = int(day.timestamp())
+    end_ts = int((day + _dt.timedelta(days=1)).timestamp())
+
+    self_username = _get_self_username()
+    names = get_contact_names()
+
+    # ---------- 1. 加载联系人属性: 静音群 / gh_ 类型 / 群成员数 ----------
+    contact_db = _get_contact_db_path()
+    muted_chats = set()
+    gh_types = {}           # {username: 'sub'|'svc'}
+    group_sizes = {}        # {username: member_count}
+    if contact_db:
+        try:
+            with closing(sqlite3.connect(f"file:{contact_db}?mode=ro", uri=True)) as c:
+                try:
+                    for (u,) in c.execute(
+                        "SELECT username FROM contact "
+                        "WHERE username LIKE '%@chatroom' AND chat_room_notify=0"
+                    ):
+                        muted_chats.add(u)
+                except sqlite3.Error:
+                    pass
+                try:
+                    # 按 verify_flag 过滤公众号, 不再按 username 前缀:
+                    # 部分公众号 username 是 wxid_* 而非 gh_*
+                    for u, vf in c.execute(
+                        "SELECT username, verify_flag FROM contact WHERE verify_flag != 0"
+                    ):
+                        vf = vf or 0
+                        if not (vf & 8):
+                            continue  # bit 3 不是公众号
+                        gh_types[u] = 'svc' if (vf & 16) else 'sub'
+                except sqlite3.Error:
+                    pass
+                try:
+                    for u, n in c.execute("""
+                        SELECT cr.username, COUNT(cm.member_id)
+                        FROM chat_room cr
+                        JOIN chatroom_member cm ON cm.room_id = cr.id
+                        GROUP BY cr.username
+                    """):
+                        group_sizes[u] = n
+                except sqlite3.Error:
+                    pass
+        except sqlite3.Error:
+            pass
+
+    # ---------- 2. 折叠伪会话跳过集 ----------
+    SKIP = {
+        'brandsessionholder', 'brandservicesessionholder',
+        'notification_messages', 'notifymessage',
+        'filehelper', 'weixin', 'fmessage', 'medianote',
+    }
+
+    def should_skip(u):
+        if not u:
+            return True
+        if u in SKIP:
+            return True
+        if u.startswith('@placeholder_'):
+            return True
+        return False
+
+    def category_of(u):
+        if '@chatroom' in u:
+            return 'group_muted' if u in muted_chats else 'group'
+        if u in gh_types:
+            return gh_types[u]          # 'sub' or 'svc'
+        return 'direct'
+
+    # ---------- 3. 扫所有 message_N.db 的 Msg_* 表 ----------
+    total = 0
+    by_category = {'direct': 0, 'group': 0, 'group_muted': 0, 'sub': 0, 'svc': 0}
+    dm_sent_by_me = 0
+    dm_received = 0
+    small_group_msgs = 0
+    skipped_rows = 0
+    per_person_direct_top = {}    # {username: count}
+    per_group_top = {}             # {username: count}
+
+    for rel_key in MSG_DB_KEYS:
+        db_path = _cache.get(rel_key)
+        if not db_path:
+            continue
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        except sqlite3.Error:
+            continue
+        try:
+            # 反查 table_name -> username
+            table_to_u = {}
+            try:
+                for (u,) in conn.execute("SELECT user_name FROM Name2Id").fetchall():
+                    if u:
+                        table_to_u[f"Msg_{hashlib.md5(u.encode()).hexdigest()}"] = u
+            except sqlite3.Error:
+                pass
+
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
+            ).fetchall()]
+
+            for tname in tables:
+                uname = table_to_u.get(tname, '')
+                if should_skip(uname):
+                    continue
+
+                cat = category_of(uname)
+
+                try:
+                    cnt = conn.execute(
+                        f"SELECT COUNT(*) FROM [{tname}] "
+                        f"WHERE create_time >= ? AND create_time < ?",
+                        (start_ts, end_ts)
+                    ).fetchone()[0]
+                except sqlite3.Error:
+                    continue
+
+                if cnt == 0:
+                    continue
+
+                total += cnt
+                by_category[cat] = by_category.get(cat, 0) + cnt
+
+                # DM 方向统计需要逐条 sender_id
+                if cat == 'direct':
+                    per_person_direct_top[uname] = per_person_direct_top.get(uname, 0) + cnt
+                    if self_username:
+                        try:
+                            rows = conn.execute(
+                                f"SELECT real_sender_id FROM [{tname}] "
+                                f"WHERE create_time >= ? AND create_time < ?",
+                                (start_ts, end_ts)
+                            ).fetchall()
+                            # Name2Id 里 self 的 rowid 就是"我"
+                            self_rowid = None
+                            try:
+                                for rid, un in conn.execute(
+                                    "SELECT rowid, user_name FROM Name2Id"
+                                ).fetchall():
+                                    if un == self_username:
+                                        self_rowid = rid
+                                        break
+                            except sqlite3.Error:
+                                pass
+                            if self_rowid is not None:
+                                for (sid,) in rows:
+                                    if sid == self_rowid:
+                                        dm_sent_by_me += 1
+                                    else:
+                                        dm_received += 1
+                            else:
+                                # 无法判断 → 计入 received 的下界
+                                dm_received += len(rows)
+                        except sqlite3.Error:
+                            pass
+
+                elif cat in ('group', 'group_muted'):
+                    per_group_top[uname] = per_group_top.get(uname, 0) + cnt
+                    # 小群过滤
+                    sz = group_sizes.get(uname)
+                    if sz is not None and sz <= small_group_max:
+                        small_group_msgs += cnt
+        finally:
+            conn.close()
+
+    # ---------- 4. 拼接输出 ----------
+    lines = []
+    lines.append(f"=== 日期 {date} 微信消息统计 ===")
+    lines.append(f"窗口: {start_ts} ~ {end_ts}  (时区={tz_label})")
+    lines.append("")
+    lines.append(f"总消息数: {total}")
+    lines.append("")
+    lines.append("按类别:")
+    lines.append(f"  一对一 (direct)      : {by_category.get('direct', 0)}")
+    lines.append(f"  群聊 (未静音)         : {by_category.get('group', 0)}")
+    lines.append(f"  群聊 (已静音)         : {by_category.get('group_muted', 0)}")
+    lines.append(f"  订阅号               : {by_category.get('sub', 0)}")
+    lines.append(f"  服务号               : {by_category.get('svc', 0)}")
+    lines.append("")
+    lines.append("一对一方向:")
+    if self_username:
+        lines.append(f"  我发出                : {dm_sent_by_me}")
+        lines.append(f"  我收到                : {dm_received}")
+        lines.append(f"  (self_username = {self_username})")
+    else:
+        lines.append("  (无法识别 self_username, 方向统计跳过)")
+    lines.append("")
+    lines.append(f"少于等于 {small_group_max} 人的小群消息数: {small_group_msgs}")
+    lines.append(f"  (基于 contact.db.chat_room JOIN chatroom_member)")
+    lines.append(f"  已知群成员数的群: {len(group_sizes)} 个")
+    lines.append(f"  其中 ≤{small_group_max} 人的: {sum(1 for n in group_sizes.values() if n <= small_group_max)} 个")
+
+    # Top 群 / Top 私聊
+    top_g = sorted(per_group_top.items(), key=lambda x: -x[1])[:5]
+    top_d = sorted(per_person_direct_top.items(), key=lambda x: -x[1])[:5]
+    if top_g:
+        lines.append("")
+        lines.append("当日 Top 5 群:")
+        for u, n in top_g:
+            nick = names.get(u, u)
+            sz = group_sizes.get(u, '?')
+            lines.append(f"  {n:>5} 条  {nick}  (成员={sz})")
+    if top_d:
+        lines.append("")
+        lines.append("当日 Top 5 一对一:")
+        for u, n in top_d:
+            nick = names.get(u, u)
+            lines.append(f"  {n:>5} 条  {nick}")
+
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     mcp.run()

@@ -1,3 +1,4 @@
 pycryptodome>=3.19,<4
 zstandard>=0.22,<1
 mcp>=1.0,<2
+tzdata>=2024.1; sys_platform == "win32"

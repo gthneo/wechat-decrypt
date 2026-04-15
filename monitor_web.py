@@ -38,17 +38,156 @@ DECRYPTED_SESSION = os.path.join(_cfg["decrypted_dir"], "session", "session.db")
 DECODED_IMAGE_DIR = _cfg.get("decoded_image_dir", os.path.join(os.path.dirname(os.path.abspath(__file__)), "decoded_images"))
 MONITOR_CACHE_DIR = os.path.join(_cfg["decrypted_dir"], "_monitor_cache")
 WECHAT_BASE_DIR = _cfg.get("wechat_base_dir", "")
+if not WECHAT_BASE_DIR:
+    # 自动推导: db_dir 的父目录 (db_dir 通常是 .../<wxid>/db_storage)
+    _db_dir_path = _cfg.get("db_dir", "")
+    if _db_dir_path and os.path.basename(os.path.normpath(_db_dir_path)).lower() == "db_storage":
+        WECHAT_BASE_DIR = os.path.dirname(os.path.normpath(_db_dir_path))
+WECHAT_FILE_DIR = os.path.join(WECHAT_BASE_DIR, "msg", "file") if WECHAT_BASE_DIR else ""
+
+
+def _resolve_file_url(title, timestamp):
+    """根据文件名 + 时间戳, 在 WECHAT_FILE_DIR/<YYYY-MM>/ 下找对应文件,
+    返回 web 可访问的 URL (通过 /file 端点服务).
+
+    检查顺序: 当月 → 前一月 → 后一月
+    返回 '' 表示未找到.
+    """
+    if not WECHAT_FILE_DIR or not title:
+        return ''
+    if not os.path.isdir(WECHAT_FILE_DIR):
+        return ''
+
+    # 时区按本地, 不强行 UTC
+    base = datetime.fromtimestamp(timestamp)
+    months_to_try = [base]
+    months_to_try.append(base - timedelta_days(30))
+    months_to_try.append(base + timedelta_days(30))
+
+    for dt in months_to_try:
+        ym = dt.strftime("%Y-%m")
+        candidate = os.path.join(WECHAT_FILE_DIR, ym, title)
+        if os.path.isfile(candidate):
+            # URL-encode 路径里的特殊字符
+            from urllib.parse import quote
+            return f"/file?p={quote(ym + '/' + title)}"
+    return ''
+
+
+def timedelta_days(n):
+    import datetime as _dt
+    return _dt.timedelta(days=n)
 IMAGE_AES_KEY = _cfg.get("image_aes_key")  # V2 格式 AES key (从微信内存提取)
 IMAGE_XOR_KEY = _cfg.get("image_xor_key", 0x88)  # XOR key
 
 POLL_MS = 30  # 高频轮询WAL/DB的mtime，30ms一次
 PORT = 5678
 
+# Bootstrap (启动恢复) 参数 — 从 config.json 读, 缺省值如下
+BOOTSTRAP_HOURS = int(_cfg.get("bootstrap_hours", 48))
+BOOTSTRAP_MAX_COUNT = int(_cfg.get("bootstrap_max_count", 500))
+BOOTSTRAP_PER_CHAT_LIMIT = int(_cfg.get("bootstrap_per_chat_limit", 10))
+
 sse_clients = []
 sse_lock = threading.Lock()
 messages_log = []
 messages_lock = threading.Lock()
 MAX_LOG = 500
+# 持久化文件 — 每条消息追加一行 JSON，重启时从这里重建 messages_log
+MESSAGES_LOG_FILE = os.path.join(_cfg["decrypted_dir"], "_messages_log.jsonl")
+
+
+_persist_dirty = threading.Event()
+
+
+def _persist_message(msg):
+    """标记 messages_log 已变更，后台线程会异步写盘 (调用方需持有 messages_lock)"""
+    _persist_dirty.set()
+
+
+def _persist_worker():
+    """后台线程: 每次 _persist_dirty 置位就把整份 messages_log 原子地写盘"""
+    while True:
+        _persist_dirty.wait()
+        _persist_dirty.clear()
+        time.sleep(0.5)  # 合并短时间内的多次写入
+        try:
+            with messages_lock:
+                snapshot = list(messages_log)
+            os.makedirs(os.path.dirname(MESSAGES_LOG_FILE), exist_ok=True)
+            tmp = MESSAGES_LOG_FILE + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                for m in snapshot:
+                    f.write(json.dumps(m, ensure_ascii=False) + '\n')
+            os.replace(tmp, MESSAGES_LOG_FILE)
+        except Exception as e:
+            print(f"[persist] 写入失败: {e}", flush=True)
+
+
+def _load_persisted_messages():
+    """启动时从 JSONL 文件恢复 messages_log。
+
+    会用最新的分类规则(load_muted_chats / load_gh_types)重算每条消息的
+    category / is_group / is_muted, 这样:
+      1. 旧格式持久化条目 (没有 category 字段) 会被正确分类
+      2. 用户改了某个群的免打扰开关后, 重启 Web UI 历史消息会按新状态归类
+      3. 之前因为 load_gh_types 只看 gh_ 前缀漏掉的 wxid_* 公众号, 现在能正确归类
+
+    最后裁剪到最后 MAX_LOG 条。
+    """
+    if not os.path.exists(MESSAGES_LOG_FILE):
+        return []
+    try:
+        with open(MESSAGES_LOG_FILE, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except Exception as e:
+        print(f"[persist] 读取失败: {e}", flush=True)
+        return []
+
+    loaded = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            loaded.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+
+    loaded = loaded[-MAX_LOG:]
+
+    # 用最新规则重新分类
+    try:
+        muted = load_muted_chats()
+        gh_types = load_gh_types()
+    except Exception:
+        muted, gh_types = set(), {}
+
+    fixed = 0
+    for m in loaded:
+        u = m.get('username', '') or ''
+        if not u:
+            continue
+        is_group = '@chatroom' in u
+        if is_group:
+            is_muted = u in muted
+            new_cat = 'group_muted' if is_muted else 'group'
+        elif u in gh_types:
+            is_muted = False
+            new_cat = gh_types[u]
+        else:
+            is_muted = False
+            new_cat = 'direct'
+        if m.get('category') != new_cat:
+            fixed += 1
+        m['category'] = new_cat
+        m['is_group'] = is_group
+        m['is_muted'] = is_muted
+
+    if fixed:
+        print(f"[persist] 重分类 {fixed} 条历史消息", flush=True)
+
+    return loaded
 _img_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix='img')
 _hidden_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='hidden')
 
@@ -437,14 +576,84 @@ def decrypt_wal_full(wal_path, out_path, enc_key):
 
 def load_contact_names():
     names = {}
+    conn = None
     try:
         conn = sqlite3.connect(CONTACT_CACHE)
         for r in conn.execute("SELECT username, nick_name, remark FROM contact").fetchall():
             names[r[0]] = r[2] if r[2] else r[1] if r[1] else r[0]
-        conn.close()
-    except:
+    except Exception:
         pass
+    finally:
+        if conn is not None:
+            conn.close()
     return names
+
+
+def load_muted_chats():
+    """返回被设为免打扰的群聊 username 集合 (chat_room_notify==0 的 @chatroom)"""
+    muted = set()
+    conn = None
+    try:
+        conn = sqlite3.connect(CONTACT_CACHE)
+        for r in conn.execute(
+            "SELECT username FROM contact WHERE username LIKE '%@chatroom' AND chat_room_notify=0"
+        ).fetchall():
+            muted.add(r[0])
+    except Exception:
+        pass
+    finally:
+        if conn is not None:
+            conn.close()
+    return muted
+
+
+def load_gh_types():
+    """返回公众号类型 dict: {username: 'svc'|'sub'}
+
+    判据 (基于 verify_flag, 不依赖 username 前缀):
+      - bit 3 (8) set     → 是公众号
+      - bit 4 (16) set    → 服务号 (svc)
+      - bit 4 not set     → 订阅号 (sub)
+
+    注意: 个别公众号的 username 是 wxid_* 而不是 gh_* (例如老账号或微信迁移过的),
+    所以只过滤 verify_flag, 不再按前缀过滤。
+    """
+    types = {}
+    conn = None
+    try:
+        conn = sqlite3.connect(CONTACT_CACHE)
+        for username, vf in conn.execute(
+            "SELECT username, verify_flag FROM contact WHERE verify_flag != 0"
+        ).fetchall():
+            vf = vf or 0
+            if not (vf & 8):
+                continue  # bit 3 未置 → 不是公众号 (可能是其它认证类型)
+            types[username] = 'svc' if (vf & 16) else 'sub'
+    except Exception:
+        pass
+    finally:
+        if conn is not None:
+            conn.close()
+    return types
+
+
+# 折叠/聚合类伪会话 — 消息会同时出现在真实群/联系人会话里，必须跳过以避免 Web UI 重复
+SKIP_USERNAMES = {
+    'brandsessionholder',          # 订阅号折叠入口
+    'brandservicesessionholder',   # 服务号折叠入口
+    'notification_messages',
+    'notifymessage',
+}
+
+
+def should_skip_username(username):
+    if not username:
+        return True
+    if username in SKIP_USERNAMES:
+        return True
+    if username.startswith('@placeholder_'):
+        return True
+    return False
 
 
 def _extract_pb_field_30(data):
@@ -621,11 +830,13 @@ def _convert_hevc_to_jpeg(hevc_path, jpeg_path):
 # ============ 监听器 ============
 
 class SessionMonitor:
-    def __init__(self, enc_key, session_db, contact_names, db_cache=None, username_db_map=None):
+    def __init__(self, enc_key, session_db, contact_names, db_cache=None, username_db_map=None, muted_chats=None, gh_types=None):
         self.enc_key = enc_key
         self.session_db = session_db
         self.wal_path = session_db + "-wal"
         self.contact_names = contact_names
+        self.muted_chats = muted_chats if muted_chats is not None else set()
+        self.gh_types = gh_types if gh_types is not None else {}
         self.db_cache = db_cache
         self.username_db_map = username_db_map or {}
         self.prev_state = {}
@@ -827,6 +1038,7 @@ class SessionMonitor:
                         'username': username,
                         'v2_unsupported': True,
                     })
+                    _persist_dirty.set()
                     return
                 elif img_name:
                     image_url = f'/img/{img_name}'
@@ -837,6 +1049,7 @@ class SessionMonitor:
                         'username': username,
                         'image_url': image_url,
                     })
+                    _persist_dirty.set()
                     print(f"  [img] 异步解密成功: {img_name}", flush=True)
                     return
                 elif attempt < 2:
@@ -974,12 +1187,21 @@ class SessionMonitor:
         global messages_log
         for ts, base, mc in hidden_msgs:
             self._shown_keys.add((username, ts, base))
+            is_muted_group = is_group and username in self.muted_chats
+            if is_group:
+                category = 'group_muted' if is_muted_group else 'group'
+            elif username in self.gh_types:
+                category = self.gh_types[username]
+            else:
+                category = 'direct'
             msg_data = {
                 'time': datetime.fromtimestamp(ts).strftime('%H:%M:%S'),
                 'timestamp': ts,
                 'chat': display,
                 'username': username,
                 'is_group': is_group,
+                'is_muted': is_muted_group,
+                'category': category,
                 'sender': sender,
             }
             if base == 3:
@@ -1033,6 +1255,7 @@ class SessionMonitor:
                 messages_log.append(msg_data)
                 if len(messages_log) > MAX_LOG:
                     messages_log = messages_log[-MAX_LOG:]
+                _persist_message(msg_data)
             broadcast_sse(msg_data)
 
     def _query_msg_content(self, username, timestamp, base_type):
@@ -1171,11 +1394,13 @@ class SessionMonitor:
                     attach = appmsg.find('.//appattach')
                     size = int(attach.findtext('totallen') or 0) if attach is not None else 0
                     ext = (attach.findtext('fileext') or '') if attach is not None else ''
+                    file_url = _resolve_file_url(title, timestamp)
                     return {
                         'type': 'file',
                         'title': title,
                         'file_ext': ext,
                         'file_size': size,
+                        'file_url': file_url or '',
                     }
                 elif app_type == 5:
                     # 链接/文章 — 清理 tracking 参数
@@ -1207,10 +1432,31 @@ class SessionMonitor:
                         'url': url,
                     }
                 elif app_type == 51:
-                    # 视频号
+                    # 视频号 (FinderFeed) — 真正的内容在 <finderFeed> 子元素里，
+                    # <title> 通常是 WeChat 自己填的 "当前版本不支持展示该内容" 占位符
+                    ff = appmsg.find('finderFeed')
+                    nickname = ''
+                    desc_text = ''
+                    feed_type = None
+                    media_count = None
+                    if ff is not None:
+                        nickname = (ff.findtext('nickname') or '').strip()
+                        desc_text = (ff.findtext('desc') or '').strip()
+                        try:
+                            feed_type = int(ff.findtext('feedType') or 0) or None
+                        except (TypeError, ValueError):
+                            feed_type = None
+                        try:
+                            media_count = int(ff.findtext('mediaCount') or 0) or None
+                        except (TypeError, ValueError):
+                            media_count = None
                     return {
                         'type': 'channels',
-                        'title': title or '视频号内容',
+                        'title': nickname or title or '视频号内容',
+                        'nickname': nickname,
+                        'desc': desc_text[:200] if desc_text else '',
+                        'feed_type': feed_type,
+                        'media_count': media_count,
                     }
                 elif app_type == 19:
                     # 聊天记录转发 — 解析 recorditem 获取消息列表
@@ -1304,6 +1550,7 @@ class SessionMonitor:
                         'username': username,
                         'rich': info,
                     })
+                    _persist_dirty.set()
                     print(f"  [rich] {info['type']} 解析成功", flush=True)
                     return
             except Exception as e:
@@ -1358,6 +1605,10 @@ class SessionMonitor:
         # 收集所有新消息，按时间排序后再推送
         new_msgs = []
         for username, curr in curr_state.items():
+            # 跳过折叠/聚合类伪会话 — 真实群/联系人会话已经覆盖了这条消息，
+            # 否则 Web UI 会出现占位会话与真实会话两条重复
+            if should_skip_username(username):
+                continue
             prev = self.prev_state.get(username)
             # 检测: 时间戳变化 OR 同一秒内消息类型变化（文字+图片组合）
             is_new = prev and (curr['timestamp'] > prev['timestamp'] or
@@ -1365,14 +1616,23 @@ class SessionMonitor:
             if is_new:
                 display = self.contact_names.get(username, username)
                 is_group = '@chatroom' in username
-                # 新群/新联系人不在缓存中时，重新加载联系人
+                # 新群/新联系人不在缓存中时，重新加载联系人 + 静音列表 + gh_ 类型
                 if display == username and username not in self.contact_names:
                     refreshed = load_contact_names()
                     self.contact_names.update(refreshed)
                     display = self.contact_names.get(username, username)
+                    self.muted_chats = load_muted_chats()
+                    self.gh_types = load_gh_types()
                 sender = ''
                 if is_group:
                     sender = self.contact_names.get(curr['sender'], curr['sender_name'] or curr['sender'])
+                is_muted_group = is_group and username in self.muted_chats
+                if is_group:
+                    category = 'group_muted' if is_muted_group else 'group'
+                elif username in self.gh_types:
+                    category = self.gh_types[username]  # 'sub' or 'svc'
+                else:
+                    category = 'direct'
 
                 summary = curr['summary']
                 if isinstance(summary, bytes):
@@ -1389,6 +1649,8 @@ class SessionMonitor:
                     'chat': display,
                     'username': username,
                     'is_group': is_group,
+                    'is_muted': is_muted_group,
+                    'category': category,
                     'sender': sender,
                     'type': format_msg_type(curr['msg_type']),
                     'type_icon': msg_type_icon(curr['msg_type']),
@@ -1432,6 +1694,7 @@ class SessionMonitor:
                 messages_log.append(msg)
                 if len(messages_log) > MAX_LOG:
                     messages_log = messages_log[-MAX_LOG:]
+                _persist_message(msg)
 
             broadcast_sse(msg)
 
@@ -1454,8 +1717,204 @@ class SessionMonitor:
         cutoff = int(time.time()) - 300
         self._shown_keys = {k for k in self._shown_keys if k[1] > cutoff}
 
-def monitor_thread(enc_key, session_db, contact_names, db_cache=None, username_db_map=None):
-    mon = SessionMonitor(enc_key, session_db, contact_names, db_cache, username_db_map)
+def bootstrap_recent_messages(mon, hours=None, max_count=None, per_chat_limit=None):
+    """启动时从 message_*.db 拉最近活跃会话的近期消息, 注入 messages_log
+
+    用途: 没有持久化历史 (或被清空) 时, 让 Web UI 重启后立刻有内容显示, 不必干等新消息.
+    数据源: 已解密 session.db 的 SessionTable + 各 message_N.db 的 Msg_<md5(username)> 表.
+
+    后处理:
+      - type=3 (图片): 调 mon.resolve_image() 解出 .dat → image_url 直接挂上, 前端立刻显示
+      - type=49 (富媒体): 调 mon._parse_rich_content() 解 AppMsg XML → rich 字段
+      - type=47 (表情): 同上
+      - 其它非文本 type: 用占位符内容, 不显示原始 XML
+
+    Args:
+        mon: SessionMonitor 实例
+        hours: 时间窗, 默认读 BOOTSTRAP_HOURS (config.bootstrap_hours, 48)
+        max_count: 最多注入条数, 默认读 BOOTSTRAP_MAX_COUNT (config.bootstrap_max_count, 500)
+        per_chat_limit: 每会话最多取 N 条, 默认读 BOOTSTRAP_PER_CHAT_LIMIT (10)
+    """
+    if hours is None:
+        hours = BOOTSTRAP_HOURS
+    if max_count is None:
+        max_count = BOOTSTRAP_MAX_COUNT
+    if per_chat_limit is None:
+        per_chat_limit = BOOTSTRAP_PER_CHAT_LIMIT
+    cutoff_ts = int(time.time()) - hours * 3600
+
+    if not os.path.exists(DECRYPTED_SESSION):
+        print(f"[bootstrap] {DECRYPTED_SESSION} 不存在, 跳过", flush=True)
+        return
+
+    try:
+        conn = sqlite3.connect(f"file:{DECRYPTED_SESSION}?mode=ro", uri=True)
+        sessions = conn.execute(
+            "SELECT username, last_timestamp, unread_count "
+            "FROM SessionTable WHERE last_timestamp > ? "
+            "ORDER BY last_timestamp DESC", (cutoff_ts,)
+        ).fetchall()
+        conn.close()
+    except Exception as e:
+        print(f"[bootstrap] session 读取失败: {e}", flush=True)
+        return
+
+    print(f"[bootstrap] 扫描 {len(sessions)} 个最近 {hours}h 活跃会话...", flush=True)
+    t0 = time.perf_counter()
+
+    candidates = []
+    seen_keys = set()
+
+    for sess in sessions:
+        username, _last_ts, unread = sess
+        if should_skip_username(username):
+            continue
+
+        db_keys = mon.username_db_map.get(username, [])
+        if not db_keys:
+            continue
+
+        table_name = f"Msg_{hashlib.md5(username.encode()).hexdigest()}"
+
+        chat_rows = []
+        for db_key in db_keys:
+            dec_path = mon.db_cache.get(db_key)
+            if not dec_path:
+                continue
+            try:
+                c = sqlite3.connect(f"file:{dec_path}?mode=ro", uri=True)
+                rows = c.execute(
+                    f"SELECT create_time, local_type, message_content, "
+                    f"WCDB_CT_message_content "
+                    f"FROM [{table_name}] "
+                    f"WHERE create_time > ? "
+                    f"ORDER BY create_time DESC LIMIT ?",
+                    (cutoff_ts, per_chat_limit)
+                ).fetchall()
+                c.close()
+                chat_rows.extend(rows)
+            except Exception:
+                continue
+
+        unique = {}
+        for r in chat_rows:
+            unique[(r[0], r[1])] = r
+        for r in sorted(unique.values(), key=lambda x: x[0]):
+            ts, lt, mc, ct = r
+            key = (username, ts, lt)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            if isinstance(mc, bytes):
+                if ct == 4:
+                    try:
+                        mc = _zstd_dctx.decompress(mc).decode('utf-8', errors='replace')
+                    except Exception:
+                        mc = mc.decode('utf-8', errors='replace')
+                else:
+                    mc = mc.decode('utf-8', errors='replace')
+            raw_text = (mc or '').strip()
+
+            base = lt % 4294967296 if lt > 4294967296 else lt
+            display = mon.contact_names.get(username, username)
+            is_group = '@chatroom' in username
+            is_muted = is_group and username in mon.muted_chats
+            if is_group:
+                cat = 'group_muted' if is_muted else 'group'
+            elif username in mon.gh_types:
+                cat = mon.gh_types[username]
+            else:
+                cat = 'direct'
+
+            # 内容字段: 文本类直接显示, 非文本类只显示占位符 (避免 XML 暴露)
+            if base == 1:
+                content = raw_text[:500]
+            elif base == 3:
+                content = '[图片]'
+            elif base == 34:
+                content = '[语音]'
+            elif base == 43:
+                content = '[视频]'
+            elif base == 47:
+                content = '[表情]'
+            elif base == 49:
+                content = '[链接/文件]'
+            else:
+                content = f'[{format_msg_type(base)}]'
+
+            candidates.append({
+                'time': datetime.fromtimestamp(ts).strftime('%H:%M:%S'),
+                'timestamp': ts,
+                'chat': display,
+                'username': username,
+                'is_group': is_group,
+                'is_muted': is_muted,
+                'category': cat,
+                'sender': '',
+                'type': format_msg_type(base),
+                'type_icon': msg_type_icon(base),
+                'content': content,
+                'unread': unread or 0,
+                '_base_type': base,   # 留给后处理用, 注入前会删掉
+            })
+
+    candidates.sort(key=lambda x: -x['timestamp'])
+    candidates = candidates[:max_count]
+    candidates.sort(key=lambda x: x['timestamp'])
+
+    if not candidates:
+        print(f"[bootstrap] 时间窗内没有可注入消息 ({(time.perf_counter()-t0)*1000:.0f}ms)", flush=True)
+        return
+
+    # ----- 后处理: 图片 → image_url, 富媒体 → rich -----
+    img_resolved = 0
+    rich_resolved = 0
+    for m in candidates:
+        base = m.pop('_base_type', None)
+        try:
+            if base == 3:
+                # 图片: 解 .dat 出 image_url
+                img_name = mon.resolve_image(m['username'], m['timestamp'])
+                if img_name and img_name != '__v2_unsupported__':
+                    m['image_url'] = f'/img/{img_name}'
+                    img_resolved += 1
+            elif base in (47, 49):
+                # 表情 / 富媒体 AppMsg
+                rich = mon._parse_rich_content(m['username'], m['timestamp'], base)
+                if rich:
+                    m['rich'] = rich
+                    rich_resolved += 1
+        except Exception:
+            # 单条解析失败不影响整体 bootstrap
+            pass
+
+    global messages_log
+    with messages_lock:
+        existing_keys = set(
+            (m.get('username', ''), m.get('timestamp', 0), m.get('type', ''))
+            for m in messages_log
+        )
+        added = 0
+        for m in candidates:
+            ekey = (m['username'], m['timestamp'], m['type'])
+            if ekey in existing_keys:
+                continue
+            existing_keys.add(ekey)
+            messages_log.append(m)
+            added += 1
+        messages_log.sort(key=lambda m: m.get('timestamp', 0))
+        if len(messages_log) > MAX_LOG:
+            messages_log = messages_log[-MAX_LOG:]
+        if added:
+            _persist_dirty.set()
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    print(f"[bootstrap] 注入 {added} 条 (图片 {img_resolved} 解出, 富媒体 {rich_resolved} 解出) {elapsed_ms:.0f}ms", flush=True)
+
+
+def monitor_thread(enc_key, session_db, contact_names, db_cache=None, username_db_map=None, muted_chats=None, gh_types=None):
+    mon = SessionMonitor(enc_key, session_db, contact_names, db_cache, username_db_map, muted_chats, gh_types)
     wal_path = mon.wal_path
 
     # 初始全量解密
@@ -1470,6 +1929,19 @@ def monitor_thread(enc_key, session_db, contact_names, db_cache=None, username_d
 
     mon.prev_state = mon.query_state()
     print(f"[monitor] 跟踪 {len(mon.prev_state)} 个会话", flush=True)
+
+    # 启动恢复: 持久化历史不足时从 message DB 拉最近消息填充窗口
+    try:
+        with messages_lock:
+            existing = len(messages_log)
+        if existing < MAX_LOG // 2:
+            print(f"[bootstrap] messages_log 仅 {existing} 条, 启动 message DB 恢复", flush=True)
+            bootstrap_recent_messages(mon)
+        else:
+            print(f"[bootstrap] messages_log 已有 {existing} 条, 跳过恢复", flush=True)
+    except Exception as e:
+        print(f"[bootstrap] 恢复失败: {e}", flush=True)
+
     print(f"[monitor] mtime轮询模式 (每{POLL_MS}ms)", flush=True)
 
     # mtime-based 轮询: WAL是预分配固定大小，不能用size检测
@@ -1539,6 +2011,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .msg-time{font-size:11px;color:#555;font-family:"SF Mono",Monaco,monospace;min-width:55px}
 .msg-chat{font-weight:600;color:#4fc3f7;font-size:13px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .msg-chat.grp{color:#ce93d8}
+.msg-chat.muted{color:#888}
+.msg[data-cat="group_muted"]{opacity:.65}
 .msg-sender{font-size:12px;color:#999}
 .msg-r{margin-left:auto;display:flex;gap:6px;align-items:center}
 .msg-type{font-size:10px;padding:2px 5px;border-radius:3px;background:rgba(255,255,255,.06);color:#777}
@@ -1556,7 +2030,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .msg-quote{background:rgba(255,255,255,.04);border-left:2px solid #666;padding:4px 8px;margin-top:4px;border-radius:0 6px 6px 0}
 .msg-quote-ref{font-size:11px;color:#777;margin-bottom:3px}
 .msg-quote-ref b{color:#999;font-weight:500}
-.msg-file{display:inline-flex;align-items:center;gap:8px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:8px 12px;margin-top:4px}
+.msg-file{display:inline-flex;align-items:center;gap:8px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:8px 12px;margin-top:4px;transition:background .2s}
+a.msg-file:hover{background:rgba(79,195,247,.12);border-color:rgba(79,195,247,.3)}
 .msg-file-icon{font-size:24px}
 .msg-file-name{font-size:13px;color:#ccc}
 .msg-file-size{font-size:11px;color:#666}
@@ -1611,6 +2086,21 @@ a.msg-link{text-decoration:none;color:inherit}
 .add-rule-btn:hover{background:rgba(79,195,247,.2)}
 /* 通知高亮 */
 .msg.notify-hl{border-left:3px solid #ffd54f;background:rgba(255,213,79,.08);box-shadow:0 0 12px rgba(255,213,79,.1)}
+/* 分类标签栏 */
+.tabs{display:flex;gap:2px;padding:6px 12px 0;background:#0a0a0f;border-bottom:1px solid rgba(255,255,255,.06);flex-shrink:0}
+.tab{padding:8px 16px;background:transparent;border:none;color:#666;font-size:13px;cursor:pointer;border-radius:6px 6px 0 0;transition:all .2s;font-weight:500}
+.tab:hover{color:#ccc;background:rgba(255,255,255,.03)}
+.tab.active{color:#4fc3f7;background:rgba(79,195,247,.08);border-bottom:2px solid #4fc3f7}
+.tab .tab-count{display:inline-block;margin-left:6px;font-size:10px;padding:1px 6px;border-radius:8px;background:rgba(255,255,255,.08);color:#888;font-weight:600}
+.tab.active .tab-count{background:rgba(79,195,247,.2);color:#4fc3f7}
+/* 按当前 tab 隐藏非目标类别的消息 */
+.messages.view-direct .msg:not([data-cat="direct"]){display:none}
+.messages.view-group .msg:not([data-cat="group"]){display:none}
+.messages.view-muted .msg:not([data-cat="group_muted"]){display:none}
+.messages.view-sub .msg:not([data-cat="sub"]){display:none}
+.messages.view-svc .msg:not([data-cat="svc"]){display:none}
+.msg[data-cat="sub"] .msg-chat{color:#ffb74d}
+.msg[data-cat="svc"] .msg-chat{color:#66bb6a}
 </style>
 </head>
 <body>
@@ -1637,6 +2127,14 @@ a.msg-link{text-decoration:none;color:inherit}
 </div>
 </div>
 <div id="lightbox" onclick="this.classList.remove('show')"><img id="lb-img" /></div>
+<div class="tabs">
+<button class="tab active" data-view="all" onclick="setView('all')">全部 <span class="tab-count" id="cnt-all">0</span></button>
+<button class="tab" data-view="direct" onclick="setView('direct')">个人 <span class="tab-count" id="cnt-direct">0</span></button>
+<button class="tab" data-view="group" onclick="setView('group')">群聊 <span class="tab-count" id="cnt-group">0</span></button>
+<button class="tab" data-view="muted" onclick="setView('muted')">静音群 <span class="tab-count" id="cnt-muted">0</span></button>
+<button class="tab" data-view="sub" onclick="setView('sub')">订阅号 <span class="tab-count" id="cnt-sub">0</span></button>
+<button class="tab" data-view="svc" onclick="setView('svc')">服务号 <span class="tab-count" id="cnt-svc">0</span></button>
+</div>
 <div class="messages" id="msgs">
 <div class="empty" id="empty"><div class="icon">📡</div><p>等待新消息...</p><p style="margin-top:6px;font-size:11px;color:#333">WAL增量解密 · SSE推送</p></div>
 </div>
@@ -1666,10 +2164,24 @@ function renderRich(r){
     let src = r.source ? '<div class="msg-link-src">'+esc(r.source)+'</div>' : '';
     return `<a href="${esc(r.url)}" target="_blank" rel="noopener" class="msg-link"><div class="msg-link-title">🔗 ${esc(r.title)}</div>${r.des?'<div class="msg-link-des">'+esc(r.des)+'</div>':''}${src}</a>`;
   }
-  if(r.type==='file') return `<div class="msg-file"><span class="msg-file-icon">📄</span><div><div class="msg-file-name">${esc(r.title)}</div><div class="msg-file-size">${r.file_ext?r.file_ext.toUpperCase()+' · ':''}${fmtSize(r.file_size)}</div></div></div>`;
+  if(r.type==='file') {
+    const inner = `<span class="msg-file-icon">📄</span><div><div class="msg-file-name">${esc(r.title)}</div><div class="msg-file-size">${r.file_ext?r.file_ext.toUpperCase()+' · ':''}${fmtSize(r.file_size)}${r.file_url?'':' · <span style="color:#ef9a9a">未在本地找到</span>'}</div></div>`;
+    if(r.file_url){
+      return `<a class="msg-file" href="${esc(r.file_url)}" target="_blank" rel="noopener" style="text-decoration:none;color:inherit">${inner}</a>`;
+    }
+    return `<div class="msg-file">${inner}</div>`;
+  }
   if(r.type==='quote') return `<div class="msg-quote"><div class="msg-quote-ref">↩ <b>${esc(r.ref_name)}</b>: ${esc(r.ref_content)}</div><div>${esc(r.title)}</div></div>`;
   if(r.type==='miniapp') return `<div class="msg-link"><div class="msg-link-title">🟢 ${esc(r.title)}</div>${r.source?'<div class="msg-link-src">小程序 · '+esc(r.source)+'</div>':''}</div>`;
-  if(r.type==='channels') return `<div class="msg-video"><span>📺</span> ${esc(r.title)} <span style="color:#666;font-size:11px">视频号</span></div>`;
+  if(r.type==='channels') {
+    let name = r.nickname || r.title || '视频号内容';
+    let badge = '';
+    if(r.feed_type===2) badge='🎬';
+    else if(r.feed_type===4) badge='🖼️'+(r.media_count?'×'+r.media_count:'');
+    else if(r.feed_type===15||r.feed_type===16) badge='🔴';
+    let descLine = r.desc ? '<div class="msg-link-des">'+(badge?badge+' ':'')+esc(r.desc)+'</div>' : (badge?'<div class="msg-link-des">'+badge+'</div>':'');
+    return `<div class="msg-video"><div class="msg-link-title">📺 ${esc(name)}</div>${descLine}<div class="msg-link-src">视频号</div></div>`;
+  }
   if(r.type==='chatlog') {
     let items = r.items||[];
     let body = '';
@@ -1784,6 +2296,31 @@ function sendNotification(m){
   if(s.sound_enabled) beep();
 }
 
+// 分类计数 + 视图切换
+const catCounts = {all:0, direct:0, group:0, group_muted:0, sub:0, svc:0};
+function catOf(m){
+  if(m.category) return m.category;
+  if(m.is_group) return m.is_muted ? 'group_muted' : 'group';
+  return 'direct';
+}
+function bumpCat(cat){
+  catCounts.all++;
+  catCounts[cat] = (catCounts[cat]||0)+1;
+  document.getElementById('cnt-all').textContent = catCounts.all;
+  document.getElementById('cnt-direct').textContent = catCounts.direct||0;
+  document.getElementById('cnt-group').textContent = catCounts.group||0;
+  document.getElementById('cnt-muted').textContent = catCounts.group_muted||0;
+  document.getElementById('cnt-sub').textContent = catCounts.sub||0;
+  document.getElementById('cnt-svc').textContent = catCounts.svc||0;
+}
+function setView(v){
+  const cls = v==='all' ? '' : 'view-'+v;
+  M.className = 'messages' + (cls?' '+cls:'');
+  for(const b of document.querySelectorAll('.tab')){
+    b.classList.toggle('active', b.dataset.view===v);
+  }
+}
+
 function addMsg(m, animate){
   // 去重（包含类型，避免同时间戳的文字+图片组合被误判重复）
   const key = m.timestamp + '|' + (m.username||m.chat) + '|' + (m.type||'');
@@ -1794,15 +2331,19 @@ function addMsg(m, animate){
   if(x) x.remove();
 
   n++;
+  const cat = catOf(m);
+  bumpCat(cat);
   document.getElementById('cnt').textContent=n+' 消息';
   if(m.decrypt_ms!=null) document.getElementById('perf').textContent=m.pages+'页/'+m.decrypt_ms+'ms';
 
   const d=document.createElement('div');
   d.className = animate ? 'msg hl' : 'msg';
+  d.dataset.cat = cat;
 
   const sn=m.sender?`<span class="msg-sender">${esc(m.sender)}</span>`:'';
   const ur=m.unread>0?`<span class="msg-unread">${m.unread}</span>`:'';
-  const cc=m.is_group?'msg-chat grp':'msg-chat';
+  let cc=m.is_group?'msg-chat grp':'msg-chat';
+  if(cat==='group_muted') cc += ' muted';
 
   let contentHtml = renderContent(m);
 
@@ -1823,8 +2364,25 @@ function addMsg(m, animate){
     document.title='('+n+') 微信监听';
   }
 
-  // 限制最多200条
-  while(M.children.length>200) M.removeChild(M.lastChild);
+  // 限制最多 500 条; 移除最旧的同时同步 decrement 计数器
+  // (否则 tab 上的 N 会无限累积, 不反映真实可见数量)
+  while(M.children.length>500){
+    const removed = M.removeChild(M.lastChild);
+    const rcat = removed.dataset.cat;
+    if(rcat){
+      catCounts.all = Math.max(0, catCounts.all - 1);
+      catCounts[rcat] = Math.max(0, (catCounts[rcat]||0) - 1);
+    }
+    n = Math.max(0, n - 1);
+  }
+  // 同步刷新 badge 文本 (即使没 evict, 调一次成本可忽略)
+  document.getElementById('cnt-all').textContent = catCounts.all;
+  document.getElementById('cnt-direct').textContent = catCounts.direct||0;
+  document.getElementById('cnt-group').textContent = catCounts.group||0;
+  document.getElementById('cnt-muted').textContent = catCounts.group_muted||0;
+  document.getElementById('cnt-sub').textContent = catCounts.sub||0;
+  document.getElementById('cnt-svc').textContent = catCounts.svc||0;
+  document.getElementById('cnt').textContent = n + ' 消息';
 }
 
 // 页面加载时请求通知权限
@@ -1961,6 +2519,66 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
 
+        elif self.path.startswith('/file'):
+            # 把 msg/file/<YYYY-MM>/<filename> 下的文件直接服务出去 (不解密, 因为本来就是明文)
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            rel = params.get('p', [''])[0]
+            if not rel or not WECHAT_FILE_DIR:
+                self.send_error(400)
+                return
+            # 防目录穿越: realpath 必须在 WECHAT_FILE_DIR 之内
+            requested = os.path.realpath(os.path.join(WECHAT_FILE_DIR, rel))
+            base_real = os.path.realpath(WECHAT_FILE_DIR)
+            if not requested.startswith(base_real + os.sep) and requested != base_real:
+                self.send_error(403)
+                return
+            if not os.path.isfile(requested):
+                self.send_error(404)
+                return
+            ext = os.path.splitext(requested)[1].lower()
+            ct = {
+                '.pdf': 'application/pdf',
+                '.doc': 'application/msword',
+                '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                '.xls': 'application/vnd.ms-excel',
+                '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                '.ppt': 'application/vnd.ms-powerpoint',
+                '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+                '.txt': 'text/plain; charset=utf-8',
+                '.csv': 'text/csv; charset=utf-8',
+                '.zip': 'application/zip',
+                '.7z': 'application/x-7z-compressed',
+                '.rar': 'application/vnd.rar',
+                '.mp4': 'video/mp4',
+                '.mp3': 'audio/mpeg',
+                '.json': 'application/json; charset=utf-8',
+                '.xml': 'application/xml; charset=utf-8',
+            }.get(ext, 'application/octet-stream')
+            try:
+                fsize = os.path.getsize(requested)
+                self.send_response(200)
+                self.send_header('Content-Type', ct)
+                self.send_header('Content-Length', str(fsize))
+                # 用 attachment 让浏览器存盘 (PDF 等可改 inline 让浏览器内嵌预览)
+                inline_types = {'application/pdf', 'image/png', 'image/jpeg', 'text/plain; charset=utf-8'}
+                disp = 'inline' if ct in inline_types else 'attachment'
+                fname_quoted = urllib.parse.quote(os.path.basename(requested))
+                self.send_header(
+                    'Content-Disposition',
+                    f"{disp}; filename*=UTF-8''{fname_quoted}"
+                )
+                self.send_header('Cache-Control', 'public, max-age=86400')
+                self.end_headers()
+                with open(requested, 'rb') as f:
+                    while True:
+                        chunk = f.read(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
         elif self.path.startswith('/api/tags'):
             parsed = urllib.parse.urlparse(self.path)
             params = urllib.parse.parse_qs(parsed.query)
@@ -2026,7 +2644,21 @@ def main():
 
     print("加载联系人...", flush=True)
     contact_names = load_contact_names()
-    print(f"已加载 {len(contact_names)} 个联系人", flush=True)
+    muted_chats = load_muted_chats()
+    gh_types = load_gh_types()
+    _sub_n = sum(1 for v in gh_types.values() if v == 'sub')
+    _svc_n = sum(1 for v in gh_types.values() if v == 'svc')
+    print(f"已加载 {len(contact_names)} 个联系人, {len(muted_chats)} 个静音群, 订阅号 {_sub_n}/服务号 {_svc_n}", flush=True)
+
+    # 从持久化文件恢复历史消息
+    global messages_log
+    persisted = _load_persisted_messages()
+    if persisted:
+        with messages_lock:
+            messages_log.extend(persisted)
+        print(f"[persist] 已恢复 {len(persisted)} 条历史消息", flush=True)
+    # 启动后台持久化线程
+    threading.Thread(target=_persist_worker, daemon=True).start()
 
     print("构建 username→DB 映射...", flush=True)
     username_db_map = build_username_db_map()
@@ -2073,7 +2705,7 @@ def main():
         print(f"[warmup] 全部完成 {(time.perf_counter()-t0)*1000:.0f}ms", flush=True)
     threading.Thread(target=_warmup, daemon=True).start()
 
-    t = threading.Thread(target=monitor_thread, args=(enc_key, session_db, contact_names, db_cache, username_db_map), daemon=True)
+    t = threading.Thread(target=monitor_thread, args=(enc_key, session_db, contact_names, db_cache, username_db_map, muted_chats, gh_types), daemon=True)
     t.start()
 
     server = ThreadedServer(('0.0.0.0', PORT), Handler)

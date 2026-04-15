@@ -8,7 +8,13 @@ import os
 import platform
 import sys
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+# PyInstaller 冻结模式下 __file__ 指向 _MEIxxxx 临时解包目录,
+# 而用户真正的 config.json 放在 .exe 所在目录, 必须用 sys.executable
+if getattr(sys, "frozen", False):
+    _APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(_APP_DIR, "config.json")
 
 _SYSTEM = platform.system().lower()
 

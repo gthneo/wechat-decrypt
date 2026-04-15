@@ -2,5 +2,10 @@
     "db_dir": "D:\\xwechat_files\\your_wxid\\db_storage",
     "keys_file": "all_keys.json",
     "decrypted_dir": "decrypted",
-    "wechat_process": "Weixin.exe"
+    "wechat_process": "Weixin.exe",
+
+    "_comment_bootstrap": "Web UI 启动恢复参数 (从 message DB 抓最近消息填充窗口)",
+    "bootstrap_hours": 48,
+    "bootstrap_max_count": 500,
+    "bootstrap_per_chat_limit": 10
 }
