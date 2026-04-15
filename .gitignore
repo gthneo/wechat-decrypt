@@ -25,6 +25,12 @@ dist/
 build/
 *.spec.bak
 
+# Network MCP runtime logs
+logs/
+
+# PR metadata (local)
+.pr_body.md
+
 # OS
 .DS_Store
 Thumbs.db

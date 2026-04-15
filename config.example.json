@@ -7,5 +7,29 @@
     "_comment_bootstrap": "Web UI 启动恢复参数 (从 message DB 抓最近消息填充窗口)",
     "bootstrap_hours": 48,
     "bootstrap_max_count": 500,
-    "bootstrap_per_chat_limit": 10
+    "bootstrap_per_chat_limit": 10,
+
+    "_comment_network": "Network MCP (SSE / streamable-http). Leave enabled=false to keep stdio-only.",
+    "network": {
+        "enabled": false,
+        "transport": "sse",
+        "bind_host": "0.0.0.0",
+        "bind_port": 8765,
+        "public_url": "",
+        "auth_token": "",
+        "tls": {
+            "enabled": false,
+            "cert": "",
+            "key": ""
+        },
+        "allow_clients": [
+            {
+                "label": "example-client",
+                "ip": "",
+                "domain": "",
+                "enabled": false
+            }
+        ],
+        "rate_limit_per_min": 120
+    }
 }

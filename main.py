@@ -80,6 +80,16 @@ def main():
     from config import load_config
     cfg = load_config()
 
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "web"
+
+    # config-web 模式不需要微信进程/密钥, 只管配置
+    if cmd == "config-web":
+        print("[*] 启动配置 Web UI (loopback)...")
+        print()
+        from config_web import main as start_config_web
+        start_config_web()
+        return
+
     # 2. 检查微信进程
     if not check_wechat_running():
         print(f"[!] 未检测到微信进程 ({cfg.get('wechat_process', 'WeChat')})")
@@ -89,9 +99,6 @@ def main():
 
     # 3. 提取密钥
     ensure_keys(cfg["keys_file"], cfg["db_dir"])
-
-    # 4. 根据子命令执行
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "web"
 
     if cmd == "decrypt":
         print("[*] 开始解密全部数据库...")
@@ -107,8 +114,9 @@ def main():
         print(f"[!] 未知命令: {cmd}")
         print()
         print("用法:")
-        print("  python main.py          启动实时消息监听 (Web UI)")
-        print("  python main.py decrypt  解密全部数据库到 decrypted/")
+        print("  python main.py              启动实时消息监听 (Web UI)")
+        print("  python main.py decrypt      解密全部数据库到 decrypted/")
+        print("  python main.py config-web   启动本地配置 UI (127.0.0.1:5679)")
         sys.exit(1)
 
 

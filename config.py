@@ -2,11 +2,14 @@
 配置加载器 - 从 config.json 读取路径配置
 首次运行时自动检测微信数据目录，检测失败则提示手动配置
 """
+import copy
 import glob
 import json
 import os
 import platform
+import secrets
 import sys
+import tempfile
 
 # PyInstaller 冻结模式下 __file__ 指向 _MEIxxxx 临时解包目录,
 # 而用户真正的 config.json 放在 .exe 所在目录, 必须用 sys.executable
@@ -29,13 +32,114 @@ else:
     _DEFAULT_TEMPLATE_DIR = r"D:\xwechat_files\your_wxid\db_storage"
     _DEFAULT_PROCESS = "Weixin.exe"
 
+_DEFAULT_NETWORK = {
+    "enabled": False,
+    "transport": "sse",            # stdio | sse | streamable-http
+    "bind_host": "0.0.0.0",
+    "bind_port": 8765,
+    "public_url": "",
+    "auth_token": "",              # 空串 = 不启用鉴权
+    "tls": {
+        "enabled": False,
+        "cert": "",
+        "key": "",
+    },
+    "allow_clients": [],           # [{label, ip, domain, enabled}]
+    "rate_limit_per_min": 120,
+}
+
 _DEFAULT = {
     "db_dir": _DEFAULT_TEMPLATE_DIR,
     "keys_file": "all_keys.json",
     "decrypted_dir": "decrypted",
     "decoded_image_dir": "decoded_images",
     "wechat_process": _DEFAULT_PROCESS,
+    "network": copy.deepcopy(_DEFAULT_NETWORK),
 }
+
+
+def _fill_network_defaults(cfg):
+    """将 network 段缺失的子字段用默认值补齐 (不覆盖已有值)。原地修改并返回 cfg。"""
+    net = cfg.get("network")
+    if not isinstance(net, dict):
+        cfg["network"] = copy.deepcopy(_DEFAULT_NETWORK)
+        return cfg
+    for key, default in _DEFAULT_NETWORK.items():
+        if key not in net:
+            net[key] = copy.deepcopy(default) if isinstance(default, (dict, list)) else default
+    # tls 子段也要填充
+    tls = net.get("tls")
+    if not isinstance(tls, dict):
+        net["tls"] = copy.deepcopy(_DEFAULT_NETWORK["tls"])
+    else:
+        for k, v in _DEFAULT_NETWORK["tls"].items():
+            if k not in tls:
+                tls[k] = v
+    # allow_clients 必须是 list
+    if not isinstance(net.get("allow_clients"), list):
+        net["allow_clients"] = []
+    return cfg
+
+
+def generate_token(nbytes: int = 32) -> str:
+    """生成一个 URL-safe 随机 token (默认 32 字节熵)。"""
+    return secrets.token_urlsafe(nbytes)
+
+
+def resolve_allowed_clients(network: dict):
+    """把 allow_clients 展开成 (ip_set, domain_set), 供 HTTP 层做 O(1) 匹配。
+
+    只收集 enabled=True 的条目。ip 做字符串精确匹配, domain 做小写匹配。
+    """
+    ip_set = set()
+    domain_set = set()
+    if not isinstance(network, dict):
+        return ip_set, domain_set
+    for entry in network.get("allow_clients") or []:
+        if not isinstance(entry, dict):
+            continue
+        if not entry.get("enabled", True):
+            continue
+        ip = (entry.get("ip") or "").strip()
+        dom = (entry.get("domain") or "").strip().lower()
+        if ip:
+            ip_set.add(ip)
+        if dom:
+            domain_set.add(dom)
+    return ip_set, domain_set
+
+
+def save_config(cfg: dict, path: str = None) -> str:
+    """原子写入 config.json: 先写临时文件, 再 rename.
+
+    - 保留 UTF-8 BOM 一致性 (无 BOM, 与现有文件一致)
+    - 4 空格缩进 + ensure_ascii=False
+    - 写入失败时不会破坏原文件
+    - 返回写入的绝对路径
+    """
+    target = path or CONFIG_FILE
+    target_abs = os.path.abspath(target)
+    target_dir = os.path.dirname(target_abs) or "."
+    os.makedirs(target_dir, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".config.",
+        suffix=".json.tmp",
+        dir=target_dir,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(cfg, f, indent=4, ensure_ascii=False)
+            f.write("\n")
+        # Windows 下 os.replace 是原子的
+        os.replace(tmp_path, target_abs)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return target_abs
 
 
 def _choose_candidate(candidates):
@@ -222,5 +326,8 @@ def load_config():
     # decoded_image_dir 默认值
     if "decoded_image_dir" not in cfg:
         cfg["decoded_image_dir"] = os.path.join(base, "decoded_images")
+
+    # network 段默认值填充 (老配置缺段时向后兼容)
+    _fill_network_defaults(cfg)
 
     return cfg
