@@ -12,6 +12,7 @@ from datetime import datetime
 import xml.etree.ElementTree as ET
 from Crypto.Cipher import AES
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 import zstandard as zstd
 from decode_image import ImageResolver
 from key_utils import get_key_info, key_path_variants, strip_key_metadata
@@ -1284,7 +1285,20 @@ def _search_all_messages(keyword, start_ts, end_ts, start_time, end_time, limit,
 
 # ============ MCP Server ============
 
-mcp = FastMCP("wechat", instructions="查询微信消息、联系人等数据")
+# FastMCP 内置 DNS rebinding 防护默认只接受 localhost/127.0.0.1 的 Host 头,
+# 跨机访问会被内层直接掐连接 (curl 看到的是 Empty reply, 无状态码).
+# 我们已经在 _build_starlette_app 的外层 AuthAllowlistMiddleware 里
+# 用 resolve_allowed_clients 做了更细粒度的 IP + Host 双路径白名单,
+# 所以这里关掉 FastMCP 的 DNS rebinding 防护, 把唯一的 gate 放在我们自己的中间件.
+# (stdio 模式下 transport_security 不起作用, 关掉也无副作用.)
+_TRANSPORT_SECURITY = TransportSecuritySettings(
+    enable_dns_rebinding_protection=False,
+)
+mcp = FastMCP(
+    "wechat",
+    instructions="查询微信消息、联系人等数据",
+    transport_security=_TRANSPORT_SECURITY,
+)
 
 # 新消息追踪
 _last_check_state = {}  # {username: last_timestamp}
