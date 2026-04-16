@@ -28,7 +28,12 @@ WAL_HEADER_SZ = 32
 WAL_FRAME_HEADER_SZ = 24
 
 # ============ 配置加载 ============
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# PyInstaller 冻结模式下 __file__ 指向 _MEIxxxx 临时解包目录,
+# 用户真正的 config.json 在 .exe 所在目录. 和 config.py 保持一致的处理.
+if getattr(sys, "frozen", False):
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
 
 with open(CONFIG_FILE, encoding="utf-8") as f:
