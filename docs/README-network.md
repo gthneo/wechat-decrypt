@@ -179,7 +179,129 @@ curl -H "Host: mcp-backend.lan" -H "Authorization: Bearer <token>" http://192.16
 
 ---
 
-## 8. 故障排查
+## 8. 只支持 stdio 的 MCP 客户端怎么接 (mcp-proxy 桥)
+
+**关键知识**: 并不是所有 MCP 客户端都支持 SSE transport. 一些集成框架 (例如 **OpenClaw**, 早期的 Claude Desktop 等) 只接受 stdio MCP — 即在本地 spawn 一个子进程通过 stdin/stdout 发 JSON-RPC, 而不会主动去 HTTP/SSE 端点拉. 在这种客户端里直接填我们的 `http://.../sse` 要么被忽略, 要么报 "unsupported transport".
+
+解决方案: 在**客户端那台机器上**装一个 stdio ↔ SSE 代理 (`mcp-proxy`), 客户端把它当作 stdio MCP server 启动, 代理在本地把 JSON-RPC 转成 SSE 请求发到远端. 数据流变成:
+
+```
+<某个 stdio-only 客户端>
+  ↓ stdio JSON-RPC (spawn subprocess)
+mcp-proxy  (客户端所在机器的本地进程)
+  ↓ HTTP GET/POST + Bearer token (SSE 协议)
+mcp_server.py  (服务端 .193:8765)
+```
+
+### 装 mcp-proxy (在客户端机器, 不是服务端)
+
+```bash
+pip3 install --user mcp-proxy
+# 装到 ~/.local/bin/mcp-proxy (Linux/macOS)
+# 或 %APPDATA%\Python\Scripts\mcp-proxy.exe (Windows 用户级)
+```
+
+### 客户端 MCP 配置
+
+替换"正常 SSE 连 URL"的配置为"启动本地 stdio 命令":
+
+**之前 (只对原生 SSE 客户端生效, 例如最新版 Claude Code)**
+
+```json
+{
+  "mcpServers": {
+    "wechat": {
+      "type": "sse",
+      "url": "http://192.168.31.193:8765/sse",
+      "headers": { "Authorization": "Bearer ${WECHAT_MCP_TOKEN}" }
+    }
+  }
+}
+```
+
+**改用 mcp-proxy (通用, 适配 stdio-only 客户端)**
+
+```json
+{
+  "mcpServers": {
+    "wechat": {
+      "command": "/home/<user>/.local/bin/mcp-proxy",
+      "args": [
+        "http://192.168.31.193:8765/sse",
+        "--transport", "sse",
+        "-H", "Authorization", "Bearer ${WECHAT_MCP_TOKEN}"
+      ]
+    }
+  }
+}
+```
+
+### OpenClaw 专用 (举例)
+
+OpenClaw 的 CLI 能通过 `openclaw mcp set <name> '<JSON>'` 直接写配置, 但它的 `McpServerConfigSchema` 只认 `{command, args, env}` 三个字段. SSE 格式即便存进去也会被 runtime 忽略. 必须用 mcp-proxy 桥:
+
+```bash
+# 1) 装代理
+pip3 install --user mcp-proxy
+
+# 2) 注册 wechat MCP (把 token 从 env 读或明文填)
+TOKEN='<your_auth_token>'
+openclaw mcp set wechat "$(cat <<EOF
+{
+  "command": "/home/$USER/.local/bin/mcp-proxy",
+  "args": [
+    "http://192.168.31.193:8765/sse",
+    "--transport", "sse",
+    "-H", "Authorization", "Bearer $TOKEN"
+  ]
+}
+EOF
+)"
+
+# 3) 重启 openclaw gateway 让它读新配置
+pkill -TERM -f openclaw-gateway
+nohup openclaw gateway > ~/.openclaw/logs/gateway.out.log 2>&1 &
+
+# 4) 退出 TUI 重开, agent 才能看到 wechat MCP 工具
+openclaw tui
+
+# 5) 验证
+# 在 TUI 里: "call the health tool from the wechat MCP"
+# 期望返回: {"ok":true,"version":"0.6.0-network","ts":...}
+```
+
+### 验证桥工作 (不依赖 agent)
+
+在客户端机器上直接跑:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0.1"}}}' | \
+  ~/.local/bin/mcp-proxy http://192.168.31.193:8765/sse \
+    --transport sse \
+    -H Authorization "Bearer $TOKEN"
+```
+
+期望 stdout 拿到 initialize 响应:
+```
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{...},"serverInfo":{"name":"wechat","version":"1.27.0"}}}
+```
+
+同时 mcp-proxy 的 log 会自动把 Authorization 头打印成 `***MASKED***`, 不会泄 token.
+
+### 什么时候**不**需要 mcp-proxy
+
+| 客户端 | 需要 mcp-proxy ? |
+|---|---|
+| Claude Desktop (最新版, `type: "sse"` 支持) | ❌ 直接填 `type: "sse"` + URL + headers |
+| Claude Code (最新版) | ❌ 直接原生接 SSE |
+| OpenClaw (本文档写作时) | ✅ 需要桥 (schema 只认 stdio) |
+| 一些早期 / 简易 MCP client | ✅ 大概率需要桥 |
+
+**不确定时的判断方法**: 看客户端文档或它保存的 MCP config 示例 — 如果样例都是 `{command, args, env}` 格式, 多半只支持 stdio, 需要桥.
+
+---
+
+## 9. 故障排查
 
 | 症状 | 可能原因 |
 |---|---|
@@ -189,11 +311,14 @@ curl -H "Host: mcp-backend.lan" -H "Authorization: Bearer <token>" http://192.16
 | curl /health 返回 200 但 /sse 返回 403 | IP 或 Host 不在 `allow_clients` 白名单里 |
 | curl /sse 返回 401 | 忘带 `Authorization: Bearer` 或 token 写错 |
 | curl /sse 返回 429 | 超过 `rate_limit_per_min` — 调大或自查客户端是否在 busy loop |
-| 上面都没事但 MCP Client 那边就是连不上 | Client 用的是 `streamable-http` 而 server 是 `sse`, 或反过来 |
+| 上面都没事但 MCP Client 那边就是连不上 | Client 用的是 `streamable-http` 而 server 是 `sse`; 或 client 只支持 stdio (要用 mcp-proxy 桥) |
+| mcp-proxy 返回 `Empty reply from server` | 连接成功但没 HTTP 响应. 多半是 FastMCP DNS rebinding 防护拦了 (我们已关, 但某些老版本可能没关净). 查 mcp_server 启动日志有没有 `enable_dns_rebinding_protection=False` |
+| agent 一直说 "找不到 wechat MCP" | 改完 mcp.servers 后**必须重启 gateway/client**, 否则 runtime 不会重新装载. TUI 里的 session 也要退出重开 |
+| 新 token 生成后 DENY_BADTOKEN | mcp_server 启动时把 token 读进内存, 改了 config.json 没 Restart 就还用旧 token. 点 config UI 的 Restart 按钮 |
 
 ---
 
-## 9. 和其它组件的关系
+## 10. 和其它组件的关系
 
 | 组件 | 端口 | 绑定 | 数据 |
 |---|---|---|---|

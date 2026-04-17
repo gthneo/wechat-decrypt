@@ -44,6 +44,7 @@ DOCS_TO_INCLUDE = [
     "docs/README-network.md",
     "docs/04-deployment.md",
     "docs/05-operations.md",
+    "docs/06-delivery.md",
 ]
 
 README_FIRST = """wechat-decrypt release package
